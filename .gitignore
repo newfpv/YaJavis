@@ -32,3 +32,15 @@ kws/bg_long/
 kws/out*/
 testdata/private/
 
+# Harness-specific configuration and metadata
+.codex/
+.claude/
+.cursor/
+.gemini/
+.opencode/
+.windsurf/
+.cline/
+.roo/
+.continue/
+.agents/skills/*/agents/
+
