@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="490" viewBox="0 0 820 490" role="img" aria-label="Колонок с Джарвисом: 114">
+<style>
+  .bg{fill:#ffffff;stroke:#d0d7de} .h{fill:#1f2328} .d{fill:#59636e} .l{fill:#1f2328;font-size:14px} .n{fill:#1f2328;font-size:14px;font-weight:700}
+  .track{fill:#eaeef2} .fill{fill:#8c959f} .acc{fill:#f77b2c} .ring{fill:none;stroke:#f77b2c}
+  text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Manrope,Roboto,Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){ .bg{fill:#16161c;stroke:#2c2c36} .h,.l,.n{fill:#efedf4} .d{fill:#9b97a8} .track{fill:#25252e} .fill{fill:#5d5a6b} }
+</style>
+<rect x="0.5" y="0.5" width="819" height="489" rx="20" class="bg"/>
+<circle cx="49" cy="59" r="14" stroke-width="5" class="ring"/>
+<text x="78" y="72" class="h" font-size="40" font-weight="800">114</text>
+<text x="162" y="55" class="h" font-size="16" font-weight="700">колонок с Джарвисом</text>
+<text x="162" y="75" class="d" font-size="14">на последней v0.9.70 — 78 · установщик скачали 141 раз</text>
+<text x="32" y="122" class="d" font-size="13" font-weight="700" letter-spacing=".4">МОДЕЛИ</text>
+<text x="426" y="122" class="d" font-size="13" font-weight="700" letter-spacing=".4">ВЕРСИИ</text>
+<text x="32" y="150" class="l">Станция Мини 2</text>
+  <rect x="32" y="158" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="158" width="292" height="6" rx="3" class="acc"/>
+  <text x="394" y="164" class="n" text-anchor="end">30</text><text x="32" y="184" class="l">Станция Мини</text>
+  <rect x="32" y="192" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="192" width="263" height="6" rx="3" class="fill"/>
+  <text x="394" y="198" class="n" text-anchor="end">27</text><text x="32" y="218" class="l">Станция Лайт</text>
+  <rect x="32" y="226" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="226" width="175" height="6" rx="3" class="fill"/>
+  <text x="394" y="232" class="n" text-anchor="end">18</text><text x="32" y="252" class="l">Станция Миди</text>
+  <rect x="32" y="260" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="260" width="127" height="6" rx="3" class="fill"/>
+  <text x="394" y="266" class="n" text-anchor="end">13</text><text x="32" y="286" class="l">Станция 2</text>
+  <rect x="32" y="294" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="294" width="117" height="6" rx="3" class="fill"/>
+  <text x="394" y="300" class="n" text-anchor="end">12</text><text x="32" y="320" class="l">Станция Лайт 2</text>
+  <rect x="32" y="328" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="328" width="97" height="6" rx="3" class="fill"/>
+  <text x="394" y="334" class="n" text-anchor="end">10</text><text x="32" y="354" class="l">Станция Мини 3</text>
+  <rect x="32" y="362" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="362" width="19" height="6" rx="3" class="fill"/>
+  <text x="394" y="368" class="n" text-anchor="end">2</text><text x="32" y="388" class="l">Другие</text>
+  <rect x="32" y="396" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="396" width="10" height="6" rx="3" class="fill"/>
+  <text x="394" y="402" class="n" text-anchor="end">1</text><text x="32" y="422" class="l">Станция Стрит</text>
+  <rect x="32" y="430" width="292" height="6" rx="3" class="track"/>
+  <rect x="32" y="430" width="10" height="6" rx="3" class="fill"/>
+  <text x="394" y="436" class="n" text-anchor="end">1</text>
+<text x="426" y="150" class="l">v0.9.70 · последняя</text>
+  <rect x="426" y="158" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="158" width="292" height="6" rx="3" class="acc"/>
+  <text x="788" y="164" class="n" text-anchor="end">78</text><text x="426" y="184" class="l">v0.9.69</text>
+  <rect x="426" y="192" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="192" width="15" height="6" rx="3" class="fill"/>
+  <text x="788" y="198" class="n" text-anchor="end">4</text><text x="426" y="218" class="l">v0.9.68</text>
+  <rect x="426" y="226" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="226" width="7" height="6" rx="3" class="fill"/>
+  <text x="788" y="232" class="n" text-anchor="end">2</text><text x="426" y="252" class="l">v0.9.67</text>
+  <rect x="426" y="260" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="260" width="15" height="6" rx="3" class="fill"/>
+  <text x="788" y="266" class="n" text-anchor="end">4</text><text x="426" y="286" class="l">v0.9.66</text>
+  <rect x="426" y="294" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="294" width="41" height="6" rx="3" class="fill"/>
+  <text x="788" y="300" class="n" text-anchor="end">11</text><text x="426" y="320" class="l">v0.9.65</text>
+  <rect x="426" y="328" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="328" width="34" height="6" rx="3" class="fill"/>
+  <text x="788" y="334" class="n" text-anchor="end">9</text><text x="426" y="354" class="l">v0.9.63</text>
+  <rect x="426" y="362" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="362" width="7" height="6" rx="3" class="fill"/>
+  <text x="788" y="368" class="n" text-anchor="end">2</text><text x="426" y="388" class="l">v0.9.62</text>
+  <rect x="426" y="396" width="292" height="6" rx="3" class="track"/>
+  <rect x="426" y="396" width="4" height="6" rx="3" class="fill"/>
+  <text x="788" y="402" class="n" text-anchor="end">1</text>
+<text x="32" y="472" class="d" font-size="12">Колонка отмечается сама (только модель и версия) · обновлено 21 ноября в 10:12 МСК</text>
+</svg>
