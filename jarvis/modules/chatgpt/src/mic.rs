@@ -11,31 +11,22 @@ const BLOCK: usize = 80;
 const CATCH_UP_ABOVE: usize = 960;
 /// Сколько тишины оставить перед речью и в паузе между словами (100 мс).
 const KEEP_PAUSE: usize = 1_600;
-/// Блок тише этого — тишина (выход Yandex VQE уже без шума и эха).
-const QUIET_AMP: u16 = 450;
-const OVERLAP: usize = 80;
-
+#[derive(Default)]
 pub struct MicClock {
-    continuation: Option<[i16; OVERLAP]>,
-}
-
-impl Default for MicClock {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub skipped_zero_samples: usize,
 }
 
 fn quiet_lead(queue: &[i16]) -> usize {
     queue
         .chunks_exact(BLOCK)
-        .take_while(|b| b.iter().all(|v| v.unsigned_abs() <= QUIET_AMP))
+        .take_while(|b| b.iter().all(|v| *v == 0))
         .count()
         * BLOCK
 }
 
 impl MicClock {
     pub fn new() -> Self {
-        Self { continuation: None }
+        Self::default()
     }
 
     pub fn take(&mut self, queue: &mut Vec<i16>) -> [i16; FRAME] {
@@ -46,16 +37,8 @@ impl MicClock {
         }
         let count = (queue.len() - skip).min(FRAME);
         frame[..count].copy_from_slice(&queue[skip..skip + count]);
-        // Стык двух кусков тишины сглаживаем, чтобы не было щелчка.
-        if skip > 0 && let Some(previous) = self.continuation.as_ref() {
-            for i in 0..OVERLAP.min(count) {
-                let n = i as i32;
-                frame[i] = ((i32::from(previous[i]) * (OVERLAP as i32 - n) + i32::from(frame[i]) * n) / OVERLAP as i32) as i16;
-            }
-        }
-        let consumed = skip + count;
-        self.continuation = queue.get(consumed..consumed + OVERLAP).and_then(|next| next.try_into().ok());
-        queue.drain(..consumed);
+        self.skipped_zero_samples += skip;
+        queue.drain(..skip + count);
         frame
     }
 }
@@ -81,15 +64,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_first_phrase_survives_connection_backlog() {
+        let speech: Vec<_> = voice(16_000).into_iter().map(|v| v / 13).collect();
+        let mut queue = speech.clone();
+        let mut mic = MicClock::new();
+        for expected in speech.chunks_exact(FRAME) {
+            assert_eq!(&mic.take(&mut queue)[..], expected);
+        }
+    }
+
+    #[test]
     fn leading_silence_shrinks_to_a_short_pause() {
-        let mut queue = vec![120i16; 16_000];
+        let mut queue = vec![0i16; 16_000];
         queue.extend(voice(3_200));
         let mut mic = MicClock::new();
         let mut out = vec![];
         while !queue.is_empty() {
             out.extend(mic.take(&mut queue));
         }
-        let first_loud = out.iter().position(|v| v.unsigned_abs() > QUIET_AMP).unwrap();
+        let first_loud = out.iter().position(|v| *v != 0).unwrap();
         assert!(first_loud <= KEEP_PAUSE + BLOCK, "тишины перед речью осталось {first_loud}");
         let speech = voice(3_200);
         let start = out.len() - 3_200;

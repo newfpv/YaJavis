@@ -1,5 +1,5 @@
 use super::{Callback,ChatGpt,opus,rtc_runtime::RoutedRuntime,live_stats::Meter};
-use std::{sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},collections::BTreeMap,time::{Duration,Instant}};
+use std::{sync::{Arc,Mutex,atomic::{AtomicBool,AtomicUsize,Ordering}},collections::BTreeMap,time::{Duration,Instant}};
 use serde_json::{Value,json};
 use base64::{Engine,engine::general_purpose::STANDARD as B64};
 use webrtc::{peer_connection::{PeerConnection,PeerConnectionBuilder,PeerConnectionEventHandler,RTCIceGatheringState,RTCPeerConnectionState},data_channel::{DataChannel,DataChannelEvent},media_stream::{track_local::{TrackLocal,static_sample::TrackLocalStaticSample},track_remote::{TrackRemote,TrackRemoteEvent}}};
@@ -18,7 +18,7 @@ const CHATGPT_VOICES: &[&str] = &[
     "aube", "rivage", "bubbie", "haetsal", "hanul", "himari", "rindo", "leher", "neer",
     "miko", "sonna", "rio", "viola", "tinta",
 ];
-pub struct RtcVoice {pub id:String,pub requested_model:&'static str,meter:Arc<Meter>,pc:Arc<dyn PeerConnection>,dc:Arc<dyn DataChannel>,dc_state:tokio::sync::watch::Receiver<u8>,pending:Arc<Mutex<Vec<i16>>>,stop:tokio::sync::watch::Sender<bool>,tasks:Mutex<Vec<tokio::task::JoinHandle<()>>>}
+pub struct RtcVoice {pub id:String,pub requested_model:&'static str,meter:Arc<Meter>,pc:Arc<dyn PeerConnection>,dc:Arc<dyn DataChannel>,dc_state:tokio::sync::watch::Receiver<u8>,pending:Arc<Mutex<Vec<i16>>>,overflow_samples:AtomicUsize,stop:tokio::sync::watch::Sender<bool>,tasks:Mutex<Vec<tokio::task::JoinHandle<()>>>}
 struct Guard(Option<Arc<dyn PeerConnection>>);
 impl Drop for Guard{fn drop(&mut self){if let Some(pc)=self.0.take() && let Ok(rt)=tokio::runtime::Handle::try_current(){rt.spawn(async move{let _=pc.close().await;});}}}
 struct StandbyInner{
@@ -406,6 +406,9 @@ impl RtcVoice {
                 if track.write_sample(ssrc,AUDIO_PAYLOAD,&rtc::media::Sample{data:packet.into(),duration:Duration::from_millis(20),..rtc::media::Sample::new(Instant::now())},&[]).await.is_err(){break;}
                 feed_meter.sent(20);
             }}}
+            if mic.skipped_zero_samples > 0 {
+                eprintln!("ChatGPT: при разборе очереди пропущено {} нулевых отсчётов", mic.skipped_zero_samples);
+            }
         });
         let mut events_stop=receiver.clone();let channel=dc.clone();let services=provider.services.clone();let event_id=id.clone();let event_auth=auth.clone();
         let event_meter=meter.clone();
@@ -454,7 +457,7 @@ impl RtcVoice {
                                 emit(&services,&event_id,"error",json!(detail.chars().take(240).collect::<String>())).await;
                                 if let Some(f)=super::account_error::classify(0,&event,60){
                                     if f.reason=="limit"{event_meter.limit();}
-                                    let _=(services)("accounts.failover".into(),json!({"before":event_auth,"reason":f.reason,"retry_s":f.retry,"tried":[event_auth["_local_id"]]})).await;
+                                    let _=(services)("accounts.failover".into(),json!({"before":event_auth,"reason":f.reason,"retry_s":f.retry,"scope":"voice","tried":[event_auth["_local_id"]]})).await;
                                     break;
                                 }
                             },_=>{},
@@ -463,11 +466,16 @@ impl RtcVoice {
                 }
             }}event_meter.finish_background();let _=dc_tx.send_replace(2);emit(&services,&event_id,"closed",Value::Null).await;
         });
-        guard.0.take();Ok(Arc::new(Self{id,requested_model,meter,pc,dc,dc_state,pending,stop,tasks:Mutex::new(vec![feeder,reader])}))
+        guard.0.take();Ok(Arc::new(Self{id,requested_model,meter,pc,dc,dc_state,pending,overflow_samples:AtomicUsize::default(),stop,tasks:Mutex::new(vec![feeder,reader])}))
     }
     pub fn feed(&self,data:&str)->Result<(),String>{
         if data.len()>256*1024{return Err("Слишком большой кадр микрофона".into());}let bytes=B64.decode(data).map_err(|_|"Неверный PCM")?;if bytes.len()%2!=0{return Err("Неверный PCM".into());}
-        let mut queue=self.pending.lock().unwrap();queue.extend(bytes.chunks_exact(2).map(|b|i16::from_le_bytes([b[0],b[1]])));if queue.len()>160000{let count=queue.len()-160000;queue.drain(..count);}Ok(())
+        let mut queue = self.pending.lock().unwrap();
+        let remaining = (20 * 16_000usize).saturating_sub(queue.len());
+        let dropped = (bytes.len() / 2).saturating_sub(remaining);
+        if dropped > 0 { self.overflow_samples.fetch_add(dropped, Ordering::Relaxed); }
+        queue.extend(bytes.chunks_exact(2).take(remaining).map(|b| i16::from_le_bytes([b[0], b[1]])));
+        Ok(())
     }
     pub async fn say(&self,text:&str)->Result<(),String>{
         let mut dc_state=self.dc_state.clone();
@@ -481,7 +489,10 @@ impl RtcVoice {
         for part in chunks(text,500){self.dc.send_text(&json!({"type":"session.context.append","channel":"speakable","content":[{"type":"input_text","text":part}]}).to_string()).await.map_err(|e|e.to_string())?;}
         Ok(())
     }
-    pub async fn close(&self){self.meter.finish();self.meter.flush().await;self.stop.send_replace(true);let _=self.pc.close().await;let tasks=std::mem::take(&mut*self.tasks.lock().unwrap());for task in tasks{task.abort();let _=task.await;}}
+    pub async fn close(&self){
+        let dropped = self.overflow_samples.swap(0, Ordering::Relaxed);
+        if dropped > 0 { eprintln!("ChatGPT: переполнение очереди RTP, пропущено {dropped} отсчётов микрофона"); }
+        self.meter.finish();self.meter.flush().await;self.stop.send_replace(true);let _=self.pc.close().await;let tasks=std::mem::take(&mut*self.tasks.lock().unwrap());for task in tasks{task.abort();let _=task.await;}}
 }
 impl Drop for RtcVoice{fn drop(&mut self){self.meter.finish_background();self.stop.send_replace(true);for task in self.tasks.lock().unwrap().drain(..){task.abort();}let pc=self.pc.clone();if let Ok(rt)=tokio::runtime::Handle::try_current(){rt.spawn(async move{let _=pc.close().await;});}}}
 fn chunks(text:&str,max:usize)->Vec<&str>{let mut result=vec![];let mut rest=text;while !rest.is_empty(){let mut end=rest.len().min(max);while !rest.is_char_boundary(end){end-=1;}if end==0{end=rest.chars().next().unwrap().len_utf8();}result.push(&rest[..end]);rest=&rest[end..];}result}

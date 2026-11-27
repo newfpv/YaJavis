@@ -756,8 +756,11 @@ impl Store {
     /// Начальные настройки от установщика (seed.json рядом с settings.json): один раз, потом файл удаляется.
     fn apply_seed(&self) -> io::Result<()> {
         let path = self.path.with_file_name("seed.json");
-        let Ok(data) = fs::read(&path) else { return Ok(()) };
-        let _ = fs::remove_file(&path);
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
         #[derive(Deserialize, Default)]
         #[serde(default)]
         struct Seed {
@@ -772,9 +775,10 @@ impl Store {
             active_prompt: String,
             profile: Option<Profile>,
         }
-        let Ok(seed) = serde_json::from_slice::<Seed>(&data) else { return Ok(()) };
+        let seed: Seed = serde_json::from_slice(&data)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Некорректный seed.json"))?;
         self.update(|s| {
-            if !seed.password_hash.is_empty() {
+            if !seed.password_hash.is_empty() && seed.password_hash != s.password_hash {
                 s.password_hash = seed.password_hash.clone();
                 s.session_key = rand_hex(32);
             }
@@ -821,7 +825,9 @@ impl Store {
                 }
             }
             Ok::<(), io::Error>(())
-        })
+        })?;
+        jarvis_station::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+        fs::remove_file(path)
     }
 }
 
@@ -900,6 +906,34 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_survives_parse_and_write_errors_and_replays_idempotently() {
+        let dir = std::env::temp_dir().join(format!("jarvis-seed-{}", rand_hex(6)));
+        let settings = dir.join("settings.json");
+        let seed = dir.join("seed.json");
+        let store = Store::open(&settings).unwrap();
+        fs::write(&seed, b"{").unwrap();
+        assert_eq!(store.apply_seed().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&seed).unwrap(), b"{");
+
+        let bytes = br#"{"city":"Test City","password_hash":"test-hash"}"#;
+        fs::write(&seed, bytes).unwrap();
+        let blocked = dir.join("settings.json.tmp");
+        fs::create_dir(&blocked).unwrap();
+        assert!(store.apply_seed().is_err());
+        assert_eq!(fs::read(&seed).unwrap(), bytes);
+        fs::remove_dir(blocked).unwrap();
+        store.apply_seed().unwrap();
+        assert!(!seed.exists());
+        let key = store.get().session_key;
+        fs::write(&seed, bytes).unwrap();
+        let restored = Store::open(settings).unwrap().get();
+        assert_eq!(restored.city, "Test City");
+        assert_eq!(restored.session_key, key);
+        assert!(!seed.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn keeps_unknown_fields() {

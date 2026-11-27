@@ -62,16 +62,17 @@ impl CoreServices {
                 return Err("official plugin required".into());
             }
             let target_id = params["id"].as_str().unwrap_or("");
+            let service = params["scope"].as_str().unwrap_or("");
             let needs_clear = self.store.with(|s| {
                 s.chatgpt_accounts
                     .iter()
                     .find(|a| a.id == target_id)
-                    .is_some_and(|a| !a.status.is_empty() || a.retry_after != 0)
+                    .is_some_and(|a| !a.status.is_empty() || a.retry_after != 0 || a.services.contains_key(service))
             });
             if needs_clear {
                 self.store
                     .update(|s| {
-                        crate::chatgpt_accounts::mark_ok(s, target_id);
+                        crate::chatgpt_accounts::mark_ok(s, target_id, service);
                         Ok::<_, std::io::Error>(())
                     })
                     .map_err(|e| e.to_string())?;
@@ -80,11 +81,16 @@ impl CoreServices {
         }
         if id == "chatgpt" && matches!(method,"auth.add"|"accounts.prepare"|"accounts.failover"|"accounts.select"|"accounts.remove") {
             if !official { return Err("official plugin required".into()); }
+            if method == "accounts.prepare" {
+                if let Some(auth) = self.store.with(|s| crate::chatgpt_accounts::prepared(s, params)) {
+                    return Ok(auth);
+                }
+            }
             let mut result=Value::Null;
             self.store.update(|s| -> Result<(),std::io::Error> {
                 result=match method {
                     "auth.add"=>crate::chatgpt_accounts::add(s,params["after"].clone()).map(|_|Value::Null),
-                    "accounts.prepare"=>crate::chatgpt_accounts::prepare(s),
+                    "accounts.prepare"=>crate::chatgpt_accounts::prepare(s,params),
                     "accounts.select"=>crate::chatgpt_accounts::select(s,params["id"].as_str().unwrap_or("")).map(|_|Value::Null),
                     "accounts.remove"=>crate::chatgpt_accounts::remove(s,params["id"].as_str().unwrap_or("")).map(|_|Value::Null),
                     _=>crate::chatgpt_accounts::failover(s,params),
@@ -312,6 +318,24 @@ mod tests {
         svc.official=Box::new(|_|false);
         for method in ["auth.get","auth.add","accounts.prepare","accounts.select","accounts.remove","accounts.failover"] {assert!(svc.call("chatgpt",method,&json!({})).is_err());assert!(svc.call("weather",method,&json!({})).is_err());}
         let reloaded=Store::open(dir.join("settings.json")).unwrap();assert_eq!(reloaded.get().chatgpt_accounts.len(),2);assert_eq!(reloaded.get().chatgpt_active,target);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_account_prepare_works_without_writing_settings() {
+        let dir = std::env::temp_dir().join(format!("jarvis-prepare-{}", crate::settings::rand_hex(6)));
+        let store = Store::open(dir.join("settings.json")).unwrap();
+        let svc = CoreServices {
+            store: store.clone(), proxy: Proxy::new(store), data_dir: dir.clone(),
+            info: Box::new(|| json!({})), official: Box::new(|_| true),
+        };
+        svc.call("chatgpt", "auth.add", &json!({"after":{"account":"a","refresh":"test"}})).unwrap();
+        let active = svc.store.get().chatgpt_active;
+        std::fs::create_dir(dir.join("settings.json.tmp")).unwrap();
+        for _ in 0..100 {
+            let auth = svc.call("chatgpt", "accounts.prepare", &json!({"scope":"voice"})).unwrap();
+            assert_eq!(auth["_local_id"], active);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

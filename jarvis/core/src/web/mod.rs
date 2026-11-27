@@ -8,7 +8,7 @@
 //!   - строгий CSP, запрет встраивания во фреймы.
 
 mod auth;
-mod backup;
+pub(crate) mod backup;
 mod chatgpt;
 mod config;
 mod diagnostics;

@@ -153,6 +153,10 @@ fn main() {
         return;
     }
     log::info!("jarvis {} (ядро на Rust)", version());
+    if let Err(e) = web::backup::recover(&f.data) {
+        log::error!("Ошибка восстановления резервной копии: {e}");
+        std::process::exit(1);
+    }
     let store = match settings::Store::open(f.data.join("settings.json")) {
         Ok(s) => s,
         Err(e) => {

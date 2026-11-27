@@ -4,7 +4,7 @@
 use crate::{
     journal::Journal,
     plugins::{BoxFut, Host, Runtime},
-    session::{Dialog, Session, queue_mic, quiet_threshold, take_mic_caught_up_with},
+    session::{Dialog, Session, queue_mic, take_mic},
     settings::{BACKEND_MODELS, Profile},
     tools::Tools,
 };
@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Condvar, LazyLock, Mutex, Weak,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -31,27 +31,6 @@ const LIVE_MODEL: &str = "GPT-Live по подписке";
 pub static LIMITED_UNTIL: AtomicI64 = AtomicI64::new(0);
 /// Сколько звука микрофона (16 кГц) уходит плагину за такт 20 мс.
 const FEED_MAX: usize = 3200;
-const PRE_SPEECH_CAP: usize = 12800;
-
-/// Обрезать только ведущую тишину до подключения WebRTC, оставляя минимум `keep` сэмплов
-/// и никогда не выкидывая кадры громче `quiet_amp` (тихая речь издалека).
-fn trim_pre_connect_silence(pending: &mut Vec<i16>, quiet_amp: u16, keep: usize) {
-    const FRAME: usize = 320;
-    let mut drop_n = 0;
-    while pending.len().saturating_sub(drop_n) >= keep + FRAME
-        && pending[drop_n..drop_n + FRAME]
-            .iter()
-            .filter(|v| v.unsigned_abs() > quiet_amp)
-            .count()
-            < 24
-    {
-        drop_n += FRAME;
-    }
-    if drop_n > 0 {
-        pending.drain(..drop_n);
-    }
-}
-
 fn unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -106,6 +85,7 @@ pub struct ChatGptSession {
     rt: tokio::runtime::Handle,
     brain: Option<Brain>,
     pending: Mutex<Vec<i16>>,
+    overflow_samples: AtomicUsize,
     out_tx: Mutex<Option<SyncSender<Vec<i16>>>>,
     out_rx: Mutex<Option<Receiver<Vec<i16>>>>,
     provider: Mutex<Option<Runtime>>,
@@ -115,8 +95,6 @@ pub struct ChatGptSession {
     done: (Mutex<bool>, Condvar),
     created:Instant,
     first_audio:AtomicBool,
-    connected:AtomicBool,
-    mic_boost_db:i64,
     last_input: Mutex<Option<Instant>>,
     proxy: Option<Arc<crate::vpn::Proxy>>,
     last_failure: Mutex<Option<crate::voice_error::VoiceFailure>>,
@@ -130,7 +108,6 @@ pub struct Open {
     pub brain: Option<Brain>,
     pub journal: Arc<Journal>,
     pub memory: Option<Arc<crate::memory::Memory>>,
-    pub mic_boost_db: i64,
     pub proxy: Option<Arc<crate::vpn::Proxy>>,
 }
 
@@ -146,6 +123,7 @@ impl ChatGptSession {
             rt: rt.clone(),
             brain: o.brain,
             pending: Mutex::default(),
+            overflow_samples: AtomicUsize::default(),
             out_tx: Mutex::new(Some(tx)),
             out_rx: Mutex::new(Some(rx)),
             provider: Mutex::default(),
@@ -153,7 +131,7 @@ impl ChatGptSession {
             cancelled: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             done: (Mutex::new(false), Condvar::new()),
-            created:Instant::now(),first_audio:AtomicBool::new(false),connected:AtomicBool::new(false),mic_boost_db:o.mic_boost_db,last_input:Mutex::default(),
+            created:Instant::now(),first_audio:AtomicBool::new(false),last_input:Mutex::default(),
             proxy: o.proxy,
             last_failure: Mutex::new(None),
         });
@@ -200,14 +178,8 @@ impl ChatGptSession {
             ));
         }
         let ok = res.is_ok();
-        let threshold = quiet_threshold(self.mic_boost_db);
         if ok {
-            let queued_samples = {
-                let mut pending = self.pending.lock().unwrap();
-                trim_pre_connect_silence(&mut pending, threshold, 2560);
-                pending.len()
-            };
-            self.connected.store(true, Ordering::Release);
+            let queued_samples = self.pending.lock().unwrap().len();
             log::info!(
                 "ChatGPT: разговор готов за {:.2} с, в очереди микрофона {:.2} с",
                 self.created.elapsed().as_secs_f64(),
@@ -224,7 +196,7 @@ impl ChatGptSession {
                 if self.cancelled.load(Ordering::SeqCst) {
                     break;
                 }
-                let pcm = take_mic_caught_up_with(&mut self.pending.lock().unwrap(), FEED_MAX, threshold);
+                let pcm = take_mic(&mut self.pending.lock().unwrap(), FEED_MAX);
                 if pcm.is_empty() {
                     break;
                 }
@@ -244,7 +216,7 @@ impl ChatGptSession {
             }
             // До 200 мс за такт, чтобы накопленный звук быстро дошёл до плагина.
             // Длинные тихие паузы сокращаем до отправки. Темп RTP задаёт плагин.
-            let pcm = take_mic_caught_up_with(&mut self.pending.lock().unwrap(), FEED_MAX, threshold);
+            let pcm = take_mic(&mut self.pending.lock().unwrap(), FEED_MAX);
             if pcm.is_empty() {
                 continue;
             }
@@ -256,6 +228,8 @@ impl ChatGptSession {
         self.out_tx.lock().unwrap().take(); // канал голоса закрывается — движок поймёт, что разговор оборвался
         SESSIONS.lock().unwrap().remove(&self.id);
         let _ = n.request("voice.close", json!({"id": self.id}), Duration::from_secs(1)).await;
+        let dropped = self.overflow_samples.load(Ordering::Relaxed);
+        if dropped > 0 { log::warn!("ChatGPT: переполнение очереди ядра, пропущено {dropped} отсчётов микрофона"); }
         self.finish();
         if ok {
             tokio::spawn(async move {
@@ -311,10 +285,10 @@ impl Session for ChatGptSession {
             *self.last_input.lock().unwrap() = Some(Instant::now());
         }
         let mut pending = self.pending.lock().unwrap();
+        let previous = pending.len();
         queue_mic(&mut pending, pcm);
-        if !self.connected.load(Ordering::Acquire) && !self.dialog.heard_input_since(self.created) {
-            trim_pre_connect_silence(&mut pending, quiet_threshold(self.mic_boost_db), PRE_SPEECH_CAP);
-        }
+        let dropped = pcm.len() - (pending.len() - previous);
+        if dropped > 0 { self.overflow_samples.fetch_add(dropped, Ordering::Relaxed); }
     }
     fn take_audio(&self) -> Option<Receiver<Vec<i16>>> {
         self.out_rx.lock().unwrap().take()
@@ -581,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_connect_silence_is_trimmed_until_speech_arrives() {
+    fn pre_connect_queue_preserves_quiet_input() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let sess = rt.block_on(async {
             let dir = std::env::temp_dir().join(format!("jarvis-cgpt-{}", std::process::id()));
@@ -597,31 +571,18 @@ mod tests {
                     brain: None,
                     journal: std::sync::Arc::new(super::Journal::default()),
                     memory: None,
-                    mic_boost_db: 18,
                     proxy: None,
                 },
             );
             super::Session::feed(&*s, &vec![50i16; 16_000]);
-            assert_eq!(s.pending.lock().unwrap().len(), super::PRE_SPEECH_CAP);
+            assert_eq!(s.pending.lock().unwrap().len(), 16_000);
             s.dialog.heard_input(std::time::Instant::now());
             super::Session::feed(&*s, &vec![2_000i16; 8_000]);
-            assert_eq!(s.pending.lock().unwrap().len(), super::PRE_SPEECH_CAP + 8_000);
+            assert_eq!(s.pending.lock().unwrap().len(), 16_000 + 8_000);
             super::Session::close(&*s);
             let _ = std::fs::remove_dir_all(dir);
         });
         let _ = sess;
 
-        // Тихая речь (> quiet_threshold) не вырезается при подключении, а ведущая тишина
-        // (включая редкие щелчки эха <24 сэмплов/кадр) перед ней — обрезается.
-        let mut pending = vec![30i16; 16_000];
-        for frame in pending.chunks_mut(320) {
-            for sample in frame.iter_mut().take(6) {
-                *sample = 900;
-            }
-        }
-        pending.extend(vec![110i16; 6_400]);
-        super::trim_pre_connect_silence(&mut pending, super::quiet_threshold(0), 2560);
-        assert_eq!(pending.len(), 6_400);
-        assert!(pending.iter().all(|&v| v == 110));
     }
 }

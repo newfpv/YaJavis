@@ -33,6 +33,11 @@
     <span class="chevron" aria-hidden="true">›</span>
   </summary>
   <div class="account-details">
+      {#each Object.entries(item.services || {}) as [service, restriction]}
+        <span class="note">{service === "voice" ? "GPT-Live" : "Codex"} · {restriction.status === "limit" ? "последний отказ по лимиту" : "нет доступа"}
+          {#if restriction.retry_after > Date.now() / 1000} · повтор после {date(restriction.retry_after)}{/if}
+        </span>
+      {/each}
     <ChatGptUsage accountId={item.id} bind:usage />
     {#if expanded}<ChatGptLiveStats stats={item.live_stats} accountId={item.id} />{/if}
     <div class="row">

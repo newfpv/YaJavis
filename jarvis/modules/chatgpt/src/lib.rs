@@ -109,19 +109,19 @@ impl ChatGpt {
         }
     }
     fn voice(&self,params:&Value)->Result<Arc<rtc_voice::RtcVoice>,String>{self.voices.lock().unwrap().get(params["id"].as_str().unwrap_or("")).cloned().ok_or("Звонок ChatGPT закрыт".into())}
-    async fn account_failure(&self,before:Value,error:&str,tried:&[Value])->Result<bool,String>{
+    async fn account_failure(&self,before:Value,error:&str,tried:&[Value],scope:&str)->Result<bool,String>{
         let Some(f)=account_error::Failure::parse(error)else{return Err(error.into())};
-        let result=(self.services)("accounts.failover".into(),json!({"before":before,"reason":f.reason,"retry_s":f.retry,"tried":tried})).await?;
+        let result=(self.services)("accounts.failover".into(),json!({"before":before,"reason":f.reason,"retry_s":f.retry,"tried":tried,"scope":scope})).await?;
         if result["switched"]==true{Ok(true)}else{Err(f.message())}
     }
     async fn open_with_failover(&self,params:&Value,generation:u64)->Result<Arc<rtc_voice::RtcVoice>,String>{
-        (self.services)("accounts.prepare".into(),Value::Null).await?;
+        (self.services)("accounts.prepare".into(),json!({"scope":"voice"})).await?;
         let mut tried=Vec::new();
         for _ in 0..8{
             if generation!=self.generation.load(std::sync::atomic::Ordering::SeqCst){return Err("Разговор отменён".into())}
             let before=(self.services)("auth.get".into(),Value::Null).await?;
             tried.push(before["_local_id"].clone());
-            let auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried).await?;continue}};
+            let auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried,"").await?;continue}};
             let mut result=rtc_voice::RtcVoice::open_auth(self,params,auth.clone()).await;
             let mut used=auth;
             if result.as_ref().err().and_then(|e|account_error::Failure::parse(e)).is_some_and(|f|f.reason=="auth"){
@@ -132,10 +132,10 @@ impl ChatGpt {
             }
             match result{
                 Ok(voice)=>{
-                    let _=(self.services)("accounts.ok".into(),json!({"id":used["_local_id"]})).await;
+                    let _=(self.services)("accounts.ok".into(),json!({"id":used["_local_id"],"scope":"voice"})).await;
                     return Ok(voice);
                 }
-                Err(e)=>{self.account_failure(used,&e,&tried).await?;}
+                Err(e)=>{self.account_failure(used,&e,&tried,"voice").await?;}
             }
         }
         Err("Все сохранённые аккаунты ChatGPT проверены; доступных нет".into())
@@ -146,7 +146,7 @@ impl ChatGpt {
         for _ in 0..8 {
             let before=(self.services)("auth.get".into(),Value::Null).await?;
             tried.push(before["_local_id"].clone());
-            match self.token().await { Ok(a)=>return Ok(a), Err(e)=>{self.account_failure(before,&e,&tried).await?;} }
+            match self.token().await { Ok(a)=>return Ok(a), Err(e)=>{self.account_failure(before,&e,&tried,"").await?;} }
         }
         Err("Нет доступного входа ChatGPT".into())
     }
@@ -197,13 +197,13 @@ impl ChatGpt {
     }
     async fn codex(&self,params:Value)->Result<Value,String>{
         let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);
-        (self.services)("accounts.prepare".into(),Value::Null).await?;
+        (self.services)("accounts.prepare".into(),json!({"scope":"codex"})).await?;
         let mut tried=Vec::new();
         for _ in 0..8 {
             if generation!=self.generation.load(std::sync::atomic::Ordering::SeqCst){return Err("Запрос отменён при смене аккаунта".into())}
             let before=(self.services)("auth.get".into(),Value::Null).await?;
             tried.push(before["_local_id"].clone());
-            let mut auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried).await?;continue}};
+            let mut auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried,"").await?;continue}};
             for attempt in 0..2 {
                 let access=auth["access"].as_str().ok_or("Нет токена ChatGPT")?;
                 let account=auth["account"].as_str().ok_or("Нет аккаунта ChatGPT")?;
@@ -211,7 +211,7 @@ impl ChatGpt {
                 let client=self.client().await?;
                 let response=client.post(&self.codex).bearer_auth(access).header("chatgpt-account-id",account).header("Accept","text/event-stream").header("OpenAI-Beta","responses=experimental").header("originator","codex_cli_rs").header("session_id",session).json(&params["body"]).send().await.map_err(|e|net_error("Нет соединения с ChatGPT",&e))?;
                 if response.status().is_success(){
-                    let _=(self.services)("accounts.ok".into(),json!({"id":auth["_local_id"]})).await;
+                    let _=(self.services)("accounts.ok".into(),json!({"id":auth["_local_id"],"scope":"codex"})).await;
                     // Never replay a request after streamed output/tool calls have started.
                     return sse(response).await;
                 }
@@ -219,7 +219,7 @@ impl ChatGpt {
                 if attempt==0 && account_error::Failure::parse(&error).is_some_and(|f|f.reason=="auth") {
                     match self.token_with_margin(i64::MAX/2).await {Ok(fresh)=>{auth=fresh;continue},Err(e)=>error=e}
                 }
-                self.account_failure(auth,&error,&tried).await?;
+                self.account_failure(auth,&error,&tried,"codex").await?;
                 break;
             }
         }

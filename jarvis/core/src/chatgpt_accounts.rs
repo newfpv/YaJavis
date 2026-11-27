@@ -16,7 +16,22 @@ pub struct Account {
     // Local retry backoff, never a quota reset timestamp.
     #[serde(default)]
     pub retry_after: i64,
+    #[serde(default)]
+    pub services: std::collections::BTreeMap<String, Restriction>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Restriction {
+    pub status: String,
+    pub retry_after: i64,
+}
+fn scope(p: &Value) -> &str {
+    match p["scope"].as_str() {
+        Some("voice") => "voice",
+        Some("codex") => "codex",
+        _ => "",
+    }
+}
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -34,6 +49,7 @@ pub fn ensure(s: &mut Settings) -> bool {
             live: Default::default(),
             status: String::new(),
             retry_after: 0,
+            services: Default::default(),
         });
         s.chatgpt_active = id;
         return true;
@@ -65,10 +81,11 @@ pub fn summary(s: &Settings) -> Value {
     json!({"active":s.chatgpt_active,"auto_switch":s.chatgpt_auto_switch,"accounts":s.chatgpt_accounts.iter().map(|a|json!({
         "id":a.id,"email":a.auth["email"],"plan":a.auth["plan"],"active":a.id==s.chatgpt_active,
         "status":if a.status.is_empty(){"ready"}else{&a.status},
-        "retry_after":a.retry_after,"live_stats":a.live.summary()})).collect::<Vec<_>>()})
+        "retry_after":a.retry_after,"services":a.services,"live_stats":a.live.summary()})).collect::<Vec<_>>()})
 }
-fn available(a: &Account) -> bool {
+fn available(a: &Account, service: &str) -> bool {
     crate::chatgpt::signed_in(&a.auth)
+        && a.services.get(service).is_none_or(|r| r.status == "limit" && r.retry_after <= now())
         && (a.status.is_empty() || (a.status == "limit" && a.retry_after <= now()))
 }
 pub fn select(s: &mut Settings, id: &str) -> Result<(), String> {
@@ -122,6 +139,7 @@ pub fn add(s: &mut Settings, mut auth: Value) -> Result<(), String> {
         live,
         status: String::new(),
         retry_after: 0,
+        services: Default::default(),
     };
     if let Some(i) = index {
         s.chatgpt_accounts[i] = a;
@@ -144,10 +162,17 @@ pub fn refreshed(s: &mut Settings, after: Value) {
         a.auth = after;
     }
 }
-pub fn prepare(s: &mut Settings) -> Result<Value, String> {
+pub fn prepared(s: &Settings, p: &Value) -> Option<Value> {
+    let active = s.chatgpt_accounts.iter().find(|a| a.id == s.chatgpt_active)?;
+    (available(active, scope(p)) && active.auth == s.chatgpt
+        && active.auth["_local_id"] == active.id && active.auth["_revision"].as_str().is_some_and(|v| !v.is_empty()))
+        .then(|| active.auth.clone())
+}
+
+pub fn prepare(s: &mut Settings, p: &Value) -> Result<Value, String> {
     ensure(s);
     if let Some(a) = s.chatgpt_accounts.iter().find(|a| a.id == s.chatgpt_active) {
-        if available(a) {
+        if available(a, scope(p)) {
             return Ok(s.chatgpt.clone());
         }
     }
@@ -155,7 +180,7 @@ pub fn prepare(s: &mut Settings) -> Result<Value, String> {
         if let Some(id) = s
             .chatgpt_accounts
             .iter()
-            .find(|a| available(a))
+            .find(|a| available(a, scope(p)))
             .map(|a| a.id.clone())
         {
             select(s, &id)?;
@@ -179,19 +204,24 @@ pub fn failover(s: &mut Settings, p: &Value) -> Result<Value, String> {
         .iter_mut()
         .find(|a| a.id == s.chatgpt_active)
     {
-        a.status = reason.into();
-        a.retry_after = if reason == "limit" {
+        let retry_after = if reason == "limit" {
             now() + p["retry_s"].as_i64().unwrap_or(60).clamp(1, 86400)
         } else {
             0
         };
+        if reason == "auth" || scope(p).is_empty() {
+            a.status = reason.into();
+            a.retry_after = retry_after;
+        } else {
+            a.services.insert(scope(p).into(), Restriction { status: reason.into(), retry_after });
+        }
     }
     if s.chatgpt_auto_switch {
         let tried = p["tried"].as_array().cloned().unwrap_or_default();
         if let Some(id) = s
             .chatgpt_accounts
             .iter()
-            .find(|a| available(a) && !tried.iter().any(|v| v == &a.id))
+            .find(|a| available(a, scope(p)) && !tried.iter().any(|v| v == &a.id))
             .map(|a| a.id.clone())
         {
             select(s, &id)?;
@@ -201,12 +231,13 @@ pub fn failover(s: &mut Settings, p: &Value) -> Result<Value, String> {
     }
     Ok(json!({"switched":false}))
 }
-pub fn mark_ok(s: &mut Settings, id: &str) -> bool {
+pub fn mark_ok(s: &mut Settings, id: &str, service: &str) -> bool {
     let Some(a) = s.chatgpt_accounts.iter_mut().find(|a| a.id == id) else {
         return false;
     };
+    let cleared = a.services.remove(service).is_some();
     if a.status.is_empty() && a.retry_after == 0 {
-        return false;
+        return cleared;
     }
     a.status.clear();
     a.retry_after = 0;
@@ -219,6 +250,30 @@ mod tests {
     fn auth(id: &str) -> Value {
         json!({"account":id,"refresh":format!("secret-refresh-{id}"),"access":format!("secret-access-{id}"),"email":format!("{id}@example.org")})
     }
+    #[test]
+    fn restrictions_apply_only_to_the_failed_service_until_auth_is_revoked() {
+        for (service, other) in [("voice", "codex"), ("codex", "voice")] {
+            let mut s = Settings::default();
+            add(&mut s, auth("a")).unwrap();
+            add(&mut s, auth("b")).unwrap();
+            let before = s.chatgpt.clone();
+            let id = s.chatgpt_active.clone();
+            failover(&mut s, &json!({"before":before,"reason":"limit","scope":service})).unwrap();
+            assert!(!mark_ok(&mut s, &id, other));
+            assert_eq!(prepare(&mut s, &json!({"scope":other})).unwrap(), before);
+            assert!(prepare(&mut s, &json!({"scope":service})).is_err());
+            s.chatgpt_auto_switch = true;
+            assert_ne!(prepare(&mut s, &json!({"scope":service})).unwrap()["_local_id"], id);
+            select(&mut s, &id).unwrap();
+            s.chatgpt_auto_switch = false;
+            let before = s.chatgpt.clone();
+            failover(&mut s, &json!({"before":before,"reason":"auth","scope":other})).unwrap();
+            for scope in [service, other] {
+                assert!(prepare(&mut s, &json!({"scope":scope})).is_err());
+            }
+        }
+    }
+
     #[test]
     fn migration_refresh_add_and_summary() {
         let mut s = Settings::default();
@@ -283,13 +338,13 @@ mod tests {
         assert_eq!(failover(&mut s, &p).unwrap()["switched"], false);
         assert_eq!(s.chatgpt_active, first);
         s.chatgpt_auto_switch = true;
-        prepare(&mut s).unwrap();
+        prepare(&mut s, &Value::Null).unwrap();
         assert_ne!(s.chatgpt_active, first);
         let p = json!({"before":s.chatgpt,"reason":"auth","tried":[]});
         assert_eq!(failover(&mut s, &p).unwrap()["switched"], false);
-        assert!(prepare(&mut s).is_err());
+        assert!(prepare(&mut s, &Value::Null).is_err());
         add(&mut s, auth("a")).unwrap();
-        assert!(prepare(&mut s).is_ok());
+        assert!(prepare(&mut s, &Value::Null).is_ok());
     }
     #[test]
     fn stale_failure_and_unknown_errors_cannot_rotate() {
@@ -321,7 +376,7 @@ mod tests {
         add(&mut s, auth("a")).unwrap();
         s.chatgpt_accounts[0].status = "limit".into();
         s.chatgpt_accounts[0].retry_after = now() - 1;
-        assert!(prepare(&mut s).is_ok());
+        assert!(prepare(&mut s, &Value::Null).is_ok());
         assert_eq!(summary(&s)["accounts"][0]["status"], "limit");
     }
     #[test]
@@ -329,11 +384,11 @@ mod tests {
         let mut s = Settings::default();
         add(&mut s, auth("a")).unwrap();
         let id = s.chatgpt_active.clone();
-        assert!(!mark_ok(&mut s, &id));
+        assert!(!mark_ok(&mut s, &id, ""));
         s.chatgpt_accounts[0].status = "limit".into();
         s.chatgpt_accounts[0].retry_after = now() + 60;
-        assert!(mark_ok(&mut s, &id));
+        assert!(mark_ok(&mut s, &id, ""));
         assert_eq!(summary(&s)["accounts"][0]["status"], "ready");
-        assert!(!mark_ok(&mut s, &id));
+        assert!(!mark_ok(&mut s, &id, ""));
     }
 }

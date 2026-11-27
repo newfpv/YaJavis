@@ -615,6 +615,7 @@ mod tests {
             live: Default::default(),
             status: String::new(),
             retry_after: 0,
+            services: Default::default(),
         });
         let extras = collect_secrets(&s);
 

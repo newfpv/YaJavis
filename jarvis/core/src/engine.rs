@@ -1011,7 +1011,6 @@ impl Engine {
                 brain: Some(self.brain(p)),
                 journal: self.journal.clone(),
                 memory: self.tools.memory.clone(),
-                mic_boost_db: s.mic_boost_db,
                 proxy: Some(self.proxy.clone()),
             },
         )
@@ -1677,7 +1676,6 @@ impl Engine {
                     brain: None,
                     journal: Arc::new(Journal::default()),
                     memory: None,
-                    mic_boost_db: 0,
                     proxy: Some(self.proxy.clone()),
                 },
             )

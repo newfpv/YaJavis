@@ -1,7 +1,10 @@
 //! Резервное копирование и восстановление настроек, памяти и данных плагинов.
 
+mod transaction;
+pub(crate) use transaction::recover;
+
 use super::{App, bad, reply};
-use crate::{hardware, plugins::install::free_mb, settings::write_atomic};
+use crate::{hardware, plugins::install::free_mb};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -271,54 +274,32 @@ pub(crate) fn parse_and_verify_backup(
     Ok((manifest, verified))
 }
 
+fn check_restore_space(data_dir: &Path, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let total_bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
+    let free = free_mb(data_dir);
+    if free < ((total_bytes >> 20) + 2) as u64 {
+        return Err(format!(
+            "Мало места на колонке для восстановления: свободно {free} МБ"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_verified_backup(
     data_dir: &Path,
     manifest: &BackupManifest,
     files: &[(String, Vec<u8>)],
 ) -> Result<RestoreReport, String> {
-    let total_bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
-    let free = free_mb(data_dir);
-    if free > 0 && free < ((total_bytes >> 20) + 2) as u64 {
-        return Err(format!(
-            "Мало места на колонке для восстановления: свободно {free} МБ"
-        ));
-    }
-
-    let staging = data_dir.join(".backup-restore.tmp");
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    for (rel, bytes) in files {
-        let staged = staging.join(rel);
-        if let Some(parent) = staged.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        fs::write(&staged, bytes).map_err(|e| e.to_string())?;
-    }
-
-    for (rel, _) in files {
-        let src = staging.join(rel);
-        let dst = data_dir.join(rel);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let bytes = fs::read(&src).map_err(|e| e.to_string())?;
-        let mode = if is_secret_path(rel) { 0o600 } else { 0o644 };
-        write_atomic(&dst, &bytes, mode).map_err(|e| format!("{rel}: {e}"))?;
-    }
-    let _ = fs::remove_dir_all(&staging);
-
     let pending: Vec<BackupPlugin> = pending_rust_plugins(manifest)
         .into_iter()
         .filter(|p| !data_dir.join("plugins").join(&p.id).join("plugin.json").is_file())
         .collect();
-    let pending_path = data_dir.join(RESTORE_PLUGINS_FILE);
-    if pending.is_empty() {
-        let _ = fs::remove_file(&pending_path);
-    } else {
-        let data = serde_json::to_vec_pretty(&pending).map_err(|e| e.to_string())?;
-        write_atomic(&pending_path, &data, 0o600).map_err(|e| e.to_string())?;
-    }
-    let _ = sync_dir(data_dir);
+    let marker = if pending.is_empty() { None } else {
+        Some(serde_json::to_vec_pretty(&pending).map_err(|e| e.to_string())?)
+    };
+    let mut changes: Vec<_> = files.iter().map(|(name, data)| (name.as_str(), Some(data.as_slice()))).collect();
+    changes.push((RESTORE_PLUGINS_FILE, marker.as_deref()));
+    transaction::apply(data_dir, &changes).map_err(|e| e.to_string())?;
 
     Ok(RestoreReport {
         schema_version: manifest.schema_version,
@@ -368,6 +349,10 @@ pub async fn restore(State(app): State<App>, body: Bytes) -> Response {
     if app.engine.talking() || app.engine.music.playing() {
         return bad("Остановите разговор и музыку перед восстановлением бэкапа");
     }
+    static RESTORING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let Ok(guard) = RESTORING.try_lock() else {
+        return bad("Восстановление уже выполняется");
+    };
     let parsed = tokio::task::spawn_blocking(move || parse_and_verify_backup(&body))
         .await
         .map_err(|e| e.to_string())
@@ -377,40 +362,52 @@ pub async fn restore(State(app): State<App>, body: Bytes) -> Response {
         Err(error) => return bad(error),
     };
 
-    app.plugins.stop_all().await;
-
-    let data_dir = app.data_dir.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        apply_verified_backup(&data_dir, &manifest, &files)
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .and_then(|r| r);
-
-    match report {
-        Ok(report) => {
-            log::info!(
-                "бэкап: восстановлено {} файлов (от версии {}, отложено плагинов: {})",
-                report.files,
-                report.app_version,
-                report.pending_plugins.len()
-            );
-            if std::env::var_os("JARVIS_READY_PATH").is_some() {
-                tokio::spawn(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    std::process::exit(0);
-                });
-            }
-            reply(StatusCode::OK, json!({
-                "ok": true,
-                "schema_version": report.schema_version,
-                "app_version": report.app_version,
-                "files": report.files,
-                "pending_plugins": report.pending_plugins,
-            }))
-        }
-        Err(error) => bad(error),
+    if let Err(error) = check_restore_space(&app.data_dir, &files) { return bad(error); }
+    if app.engine.talking() || app.engine.music.playing() {
+        return bad("Остановите разговор и музыку перед восстановлением бэкапа");
     }
+    // Complete the transaction even if the uploading client disconnects.
+    tokio::spawn(async move {
+        let running = app.plugins.running_ids();
+        app.plugins.stop_all().await;
+
+        let data_dir = app.data_dir.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            apply_verified_backup(&data_dir, &manifest, &files)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+
+        match report {
+            Ok(report) => {
+                log::info!(
+                    "бэкап: восстановлено {} файлов (от версии {}, отложено плагинов: {})",
+                    report.files,
+                    report.app_version,
+                    report.pending_plugins.len()
+                );
+                if std::env::var_os("JARVIS_READY_PATH").is_some() {
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        std::process::exit(0);
+                    });
+                }
+                reply(StatusCode::OK, json!({
+                    "ok": true,
+                    "schema_version": report.schema_version,
+                    "app_version": report.app_version,
+                    "files": report.files,
+                    "pending_plugins": report.pending_plugins,
+                }))
+            }
+            Err(error) => {
+                for id in running { app.plugins.start(&id).await; }
+                bad(error)
+            }
+        }
+    }).await.unwrap_or_else(|e| bad(e.to_string()))
 }
 
 #[cfg(test)]

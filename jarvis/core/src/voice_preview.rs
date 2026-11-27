@@ -461,7 +461,6 @@ impl Engine {
                     brain: None,
                     journal,
                     memory: None,
-                    mic_boost_db: 0,
                     proxy: Some(self.proxy.clone()),
                 },
             ),

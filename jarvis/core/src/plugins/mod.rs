@@ -701,6 +701,12 @@ impl Host {
         }
     }
 
+    pub fn running_ids(&self) -> Vec<String> {
+        self.inner.lock().unwrap().plugins.iter()
+            .filter(|(_, p)| p.rt.as_ref().is_some_and(Runtime::running))
+            .map(|(id, _)| id.clone()).collect()
+    }
+
     pub async fn stop_all(&self) {
         let rts: Vec<Runtime> = {
             let mut g = self.inner.lock().unwrap();
